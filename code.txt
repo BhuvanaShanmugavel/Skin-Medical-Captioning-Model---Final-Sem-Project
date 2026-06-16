@@ -1,0 +1,988 @@
+1 import numpy as np
+import tensorflow as tf
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.layers import Conv2D, UpSampling2D, BatchNormalization, Dropout
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import Callback
+import tensorflow.keras.backend as K
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import os
+
+# === Load preprocessed data ===
+X = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/Dermnet_TrainTestSplit/PreprocessedImages/X_train.npy").astype(np.float32)
+print("? X shape:", X.shape)
+
+# === Split X into training and validation ===
+X_train, X_val = train_test_split(X, test_size=0.2, random_state=42)
+print("? X_train shape:", X_train.shape)
+print("? X_val shape:", X_val.shape)
+
+# === Loss and Metrics ===
+def dice_loss(y_true, y_pred):
+    numerator = 2 * K.sum(y_true * y_pred)
+    denominator = K.sum(y_true + y_pred)
+    return 1 - numerator / (denominator + K.epsilon())
+
+def jaccard_index(y_true, y_pred):
+    intersection = K.sum(K.abs(y_true * y_pred))
+    union = K.sum(y_true) + K.sum(y_pred) - intersection
+    return intersection / (union + K.epsilon())
+
+def dice_coefficient(y_true, y_pred):
+    intersection = K.sum(K.abs(y_true * y_pred))
+    return (2. * intersection) / (K.sum(y_true) + K.sum(y_pred) + K.epsilon())
+
+# === FCN-VGG16 Model ===
+def build_fcn_vgg16(input_shape=(224, 224, 3)):
+    base_model = VGG16(weights="imagenet", include_top=False, input_shape=input_shape)
+    e5 = base_model.get_layer("block5_conv3").output
+
+    d4 = UpSampling2D((2, 2))(e5)
+    d4 = Conv2D(512, (3, 3), activation="relu", padding="same")(d4)
+    d4 = BatchNormalization()(d4)
+    d4 = Dropout(0.3)(d4)
+
+    d3 = UpSampling2D((2, 2))(d4)
+    d3 = Conv2D(256, (3, 3), activation="relu", padding="same")(d3)
+    d3 = BatchNormalization()(d3)
+    d3 = Dropout(0.3)(d3)
+
+    d2 = UpSampling2D((2, 2))(d3)
+    d2 = Conv2D(128, (3, 3), activation="relu", padding="same")(d2)
+    d2 = BatchNormalization()(d2)
+
+    d1 = UpSampling2D((2, 2))(d2)
+    d1 = Conv2D(64, (3, 3), activation="relu", padding="same")(d1)
+    d1 = BatchNormalization()(d1)
+
+    output = Conv2D(1, (1, 1), activation="sigmoid", padding="same")(d1)
+    return Model(inputs=base_model.input, outputs=output)
+
+model = build_fcn_vgg16()
+model.compile(optimizer=Adam(3e-5), loss=dice_loss, metrics=["accuracy", jaccard_index, dice_coefficient])
+model.summary()
+
+# === Training Configuration ===
+batch_size = 32
+epochs = 50
+steps_per_epoch = len(X_train) // batch_size
+validation_steps = len(X_val) // batch_size
+
+# === Custom Callbacks ===
+class EarlyStoppingAndSaveMasks(Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        acc = logs.get("val_accuracy", 0)
+        jacc = logs.get("val_jaccard_index", 0)
+        dice = logs.get("val_dice_coefficient", 0)
+        if 0.94 <= jacc <= 0.96 and 0.90 <= dice <= 0.95 and 0.90 <= acc <= 0.95:
+            print(f"\n? Early stopping at epoch {epoch+1} Criteria Met")
+            self.model.stop_training = True
+
+            # Generate masks using the trained model
+            Y_train = model.predict(X_train, verbose=1)
+            Y_test = model.predict(X_val, verbose=1)
+            np.save("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/Y_train.npy", Y_train)
+            np.save("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/Y_test.npy", Y_test)
+            print("?? Saved Y_train and Y_test masks.")
+
+class BestModelSaver(Callback):
+    def __init__(self, save_path):
+        super().__init__()
+        self.best_jacc = 0
+        self.best_dice = 0
+        self.best_acc = 0
+        self.save_path = save_path
+
+    def on_epoch_end(self, epoch, logs=None):
+        jacc = logs.get("val_jaccard_index", 0)
+        dice = logs.get("val_dice_coefficient", 0)
+        acc = logs.get("val_accuracy", 0)
+
+        if jacc > self.best_jacc and dice > self.best_dice and acc > self.best_acc:
+            print(f"\n?? Saving new best model at epoch {epoch+1}")
+            self.best_jacc = jacc
+            self.best_dice = dice
+            self.best_acc = acc
+            self.model.save(self.save_path)
+
+class EpochProgressBar(Callback):
+    def on_epoch_begin(self, epoch, logs=None):
+        self.epoch_bar = tqdm(total=steps_per_epoch, desc=f"Epoch {epoch+1}", dynamic_ncols=True, position=0, leave=True)
+
+    def on_batch_end(self, batch, logs=None):
+        self.epoch_bar.update(1)
+        if batch % 10 == 0:
+            self.epoch_bar.set_postfix_str(f"Loss={logs['loss']:.4f}, Acc={logs['accuracy']*100:.2f}%", refresh=True)
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.epoch_bar.set_postfix_str(
+            f"Loss={logs['loss']:.4f}, Acc={logs['accuracy']*100:.2f}%, "
+            f"Val Loss={logs['val_loss']:.4f}, Val Acc={logs['val_accuracy']*100:.2f}%", refresh=True)
+        self.epoch_bar.close()
+
+# === Start Training ===
+best_model_path = "/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/discriminator_bestmodel.keras"
+history = model.fit(
+    X_train, X_train,
+    epochs=epochs,
+    batch_size=batch_size,
+    validation_data=(X_val, X_val),
+    steps_per_epoch=steps_per_epoch,
+    validation_steps=validation_steps,
+    callbacks=[
+        EpochProgressBar(),
+        EarlyStoppingAndSaveMasks(),
+        BestModelSaver(save_path=best_model_path)
+    ]
+)
+
+# === Save Final Model ===
+model.save("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/FinalDiscriminator.keras")
+print("? Final model saved successfully.")
+ for this i got mask images as output using this i trained unet 
+2 import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import (Input, Conv2D, MaxPooling2D, UpSampling2D, Concatenate)
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import Callback
+import tensorflow.keras.backend as K
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import os
+
+# === Load and Normalize Preprocessed Data ===
+X = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/Dermnet_TrainTestSplit/PreprocessedImages/X_train.npy").astype(np.float32) / 255.0
+Y_train = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/Y_train.npy")
+Y_val = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/Y_val.npy")
+
+Y_train = (Y_train > 0.5).astype(np.float32)
+Y_val = (Y_val > 0.5).astype(np.float32)
+
+# === Split X into training and validation ===
+X_train_full = X[:len(Y_train) + len(Y_val)]
+X_train, X_val = train_test_split(X_train_full, test_size=len(Y_val), shuffle=False)
+
+print("\n? Data Shapes")
+print("X_train:", X_train.shape, type(X_train), X_train.dtype)
+print("X_val:", X_val.shape, type(X_val), X_val.dtype)
+print("Y_train:", Y_train.shape, type(Y_train), Y_train.dtype)
+print("Y_val:", Y_val.shape, type(Y_val), Y_val.dtype)
+
+# === Loss and Metrics ===
+def dice_loss(y_true, y_pred):
+    numerator = 2 * K.sum(y_true * y_pred)
+    denominator = K.sum(y_true + y_pred)
+    return 1 - numerator / (denominator + K.epsilon())
+
+def jaccard_index(y_true, y_pred):
+    intersection = K.sum(K.abs(y_true * y_pred))
+    union = K.sum(y_true) + K.sum(y_pred) - intersection
+    return intersection / (union + K.epsilon())
+
+def dice_coefficient(y_true, y_pred):
+    intersection = K.sum(K.abs(y_true * y_pred))
+    return (2. * intersection) / (K.sum(y_true) + K.sum(y_pred) + K.epsilon())
+
+def binary_mask_accuracy(y_true, y_pred):
+    y_pred_binary = K.cast(y_pred > 0.5, dtype='float32')
+    return K.mean(K.equal(y_true, y_pred_binary))
+
+# === U-Net Model ===
+def build_unet(input_shape=(224, 224, 3)):
+    inputs = Input(input_shape)
+    c1 = Conv2D(64, 3, activation='relu', padding='same')(inputs)
+    p1 = MaxPooling2D()(c1)
+
+    c2 = Conv2D(128, 3, activation='relu', padding='same')(p1)
+    p2 = MaxPooling2D()(c2)
+
+    c3 = Conv2D(256, 3, activation='relu', padding='same')(p2)
+
+    u4 = UpSampling2D()(c3)
+    u4 = Concatenate()([u4, c2])
+    c4 = Conv2D(128, 3, activation='relu', padding='same')(u4)
+
+    u5 = UpSampling2D()(c4)
+    u5 = Concatenate()([u5, c1])
+    c5 = Conv2D(64, 3, activation='relu', padding='same')(u5)
+
+    outputs = Conv2D(1, 1, activation='sigmoid')(c5)
+    return Model(inputs, outputs)
+
+model = build_unet()
+model.compile(optimizer=Adam(learning_rate=1e-4), loss=dice_loss,
+              metrics=[binary_mask_accuracy, jaccard_index, dice_coefficient])
+model.summary()
+print("\n? Model Compiled with Metrics:")
+print("    Custom Binary Accuracy")
+print("    Dice Loss (as main loss)")
+print("    Jaccard Index")
+print("    Dice Similarity Coefficient")
+
+# === Training Configuration ===
+batch_size = 32
+epochs = 50
+steps_per_epoch = len(X_train) // batch_size
+validation_steps = len(X_val) // batch_size
+
+# === Callbacks ===
+class BestModelSaver(Callback):
+    def __init__(self, save_path):
+        super().__init__()
+        self.best_score = 0
+        self.save_path = save_path
+
+    def on_epoch_end(self, epoch, logs=None):
+        acc = logs.get("val_binary_mask_accuracy", 0)
+        jacc = logs.get("val_jaccard_index", 0)
+        dice = logs.get("val_dice_coefficient", 0)
+        score = (acc + jacc + dice) / 3
+        if score > self.best_score and acc > 0.90 and jacc > 0.90 and dice > 0.90:
+            self.best_score = score
+            print(f"\n? Saving best model at epoch {epoch + 1} with Score={score:.4f}")
+            self.model.save(self.save_path)
+
+class EpochProgressBar(Callback):
+    def on_epoch_begin(self, epoch, logs=None):
+        self.epoch_bar = tqdm(total=steps_per_epoch, desc=f"Epoch {epoch + 1:02d}", dynamic_ncols=True)
+
+    def on_batch_end(self, batch, logs=None):
+        if logs is not None:
+            self.epoch_bar.set_postfix(
+                Loss=f"{logs['loss']:.4f}",
+                Acc=f"{logs['binary_mask_accuracy']*100:.2f}%")
+        self.epoch_bar.update(1)
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.epoch_bar.set_postfix(
+            Loss=f"{logs['loss']:.4f}",
+            Acc=f"{logs['binary_mask_accuracy']*100:.2f}%",
+            Val_Loss=f"{logs['val_loss']:.4f}",
+            Val_Acc=f"{logs['val_binary_mask_accuracy']*100:.2f}%",
+            Jaccard=f"{logs['val_jaccard_index']:.4f}",
+            Dice=f"{logs['val_dice_coefficient']:.4f}")
+        self.epoch_bar.close()
+        print(f"\n?? Epoch {epoch+1:02d} Summary:")
+        print(f"    Accuracy: {logs['val_binary_mask_accuracy']:.4f}")
+        print(f"    Dice Coefficient: {logs['val_dice_coefficient']:.4f}")
+        print(f"    Jaccard Index: {logs['val_jaccard_index']:.4f}")
+
+# === Train ===
+model.fit(
+    X_train, Y_train,
+    validation_data=(X_val, Y_val),
+    batch_size=batch_size,
+    epochs=epochs,
+    callbacks=[
+        EpochProgressBar(),
+        BestModelSaver("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/unet_discriminator_bestmodel.keras")
+    ]
+)
+
+# === Save Final Model ===
+model.save("/SASTRA-NEW-CLUSTER/users/bhuvana/dataset/unet_FinalDiscriminator.keras")
+print("? Final model saved successfully.")
+after this i tested a model after this i trained autoencoder in finetuned model
+3 import os
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (Input, Conv2D, Conv2DTranspose, ReLU, Dropout,
+                                     BatchNormalization, GaussianNoise)
+from tensorflow.keras.regularizers import l2
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+# === CONFIGURATION === #
+train_path = "/nfsshare/bhuvana/Dataset/dataset/Dermnet_TrainTestSplit/PreprocessedImages/X_train.npy"
+final_model_path = "/nfsshare/bhuvana/Dataset/dataset/Dermnet_TrainTestSplit/PreprocessedImages/finalmodel1.keras"
+best_model_path = "/nfsshare/bhuvana/Dataset/dataset/Dermnet_TrainTestSplit/PreprocessedImages/bestmodel1.keras"
+
+batch_size = 32
+epochs = 5
+val_split = 0.15
+image_shape = (224, 224, 3)
+target_mse_range = (0.02, 0.06)
+target_mae_range = (0.11, 0.15)
+
+# === MEMORY-EFFICIENT LOADING === #
+X_memmap = np.load(train_path, mmap_mode='r')
+total_samples = X_memmap.shape[0]
+indices = np.arange(total_samples)
+train_idx, val_idx = train_test_split(indices, test_size=val_split, random_state=42)
+
+def create_dataset(memmap_data, indices, batch_size):
+    def generator():
+        for i in range(0, len(indices), batch_size):
+            batch_indices = indices[i:i+batch_size]
+            batch = memmap_data[batch_indices].astype('float32') / 255.0
+            yield batch, batch
+    dataset = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=(
+            tf.TensorSpec(shape=(None, *image_shape), dtype=tf.float32),
+            tf.TensorSpec(shape=(None, *image_shape), dtype=tf.float32)
+        )
+    )
+    return dataset.prefetch(tf.data.AUTOTUNE)
+
+train_dataset = create_dataset(X_memmap, train_idx, batch_size)
+val_dataset = create_dataset(X_memmap, val_idx, batch_size)
+
+# === BUILD AUTOENCODER === #
+def build_autoencoder(input_shape=(224, 224, 3)):
+    inputs = Input(shape=input_shape)
+    x = GaussianNoise(0.05)(inputs)
+
+    x = Conv2D(64, (3, 3), strides=2, padding='same', kernel_regularizer=l2(1e-5))(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    x = Dropout(0.3)(x)
+
+    x = Conv2D(128, (3, 3), strides=2, padding='same', kernel_regularizer=l2(1e-5))(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    x = Dropout(0.3)(x)
+
+    x = Conv2D(256, (3, 3), strides=2, padding='same', kernel_regularizer=l2(1e-5))(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+    x = Dropout(0.3)(x)
+
+    x = Conv2DTranspose(256, (3, 3), strides=2, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+
+    x = Conv2DTranspose(128, (3, 3), strides=2, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+
+    x = Conv2DTranspose(64, (3, 3), strides=2, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = ReLU()(x)
+
+    outputs = Conv2DTranspose(3, (3, 3), activation='sigmoid', padding='same')(x)
+    return Model(inputs, outputs)
+
+# === COMBINED LOSS === #
+def combined_loss(y_true, y_pred):
+    mse = tf.reduce_mean(tf.square(y_true - y_pred))
+    mae = tf.reduce_mean(tf.abs(y_true - y_pred))
+    return 0.7 * mse + 0.3 * mae
+
+# === WARM-UP + DECAY LR === #
+class WarmupExponentialDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, initial_lr, warmup_steps, decay_steps, decay_rate):
+        super().__init__()
+        self.initial_lr = initial_lr
+        self.warmup_steps = warmup_steps
+        self.decay_steps = decay_steps
+        self.decay_rate = decay_rate
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup_lr = self.initial_lr * (step / self.warmup_steps)
+        decayed_lr = self.initial_lr * tf.pow(self.decay_rate, (step - self.warmup_steps) / self.decay_steps)
+        return tf.cond(step < self.warmup_steps, lambda: warmup_lr, lambda: decayed_lr)
+
+    def get_config(self):
+        return {
+            "initial_lr": self.initial_lr,
+            "warmup_steps": self.warmup_steps,
+            "decay_steps": self.decay_steps,
+            "decay_rate": self.decay_rate
+        }
+
+lr_schedule = WarmupExponentialDecay(1e-3, warmup_steps=500, decay_steps=1500, decay_rate=0.9)
+
+# === COMPILE MODEL === #
+autoencoder = build_autoencoder()
+autoencoder.summary()
+autoencoder.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule),
+                    loss=combined_loss,
+                    metrics=['mse', 'mae'])
+
+# === TRAIN LOOP === #
+print("\n?? Starting Training...\n")
+best_combined = float('inf')
+best_saved = False
+
+for epoch in range(epochs):
+    print(f"\n?? Epoch {epoch + 1}/{epochs}")
+    total_batches = (len(train_idx) + batch_size - 1) // batch_size
+    progbar = tqdm(enumerate(train_dataset), total=total_batches, desc="Training", unit="batch")
+    train_loss, train_mse, train_mae = [], [], []
+
+    for _, (x_batch, _) in progbar:
+        metrics = autoencoder.train_on_batch(x_batch, x_batch)
+        train_loss.append(metrics[0])
+        train_mse.append(metrics[1])
+        train_mae.append(metrics[2])
+        progbar.set_postfix({
+            "Loss": f"{np.mean(train_loss):.6f}",
+            "MSE": f"{np.mean(train_mse):.6f}",
+            "MAE": f"{np.mean(train_mae):.6f}"
+        })
+
+    # === VALIDATION === #
+    val_loss, val_mse, val_mae = [], [], []
+    for x_val, _ in val_dataset:
+        metrics = autoencoder.test_on_batch(x_val, x_val)
+        val_loss.append(metrics[0])
+        val_mse.append(metrics[1])
+        val_mae.append(metrics[2])
+
+    avg_val_loss = np.mean(val_loss)
+    avg_val_mse = np.mean(val_mse)
+    avg_val_mae = np.mean(val_mae)
+    combined = avg_val_mse + avg_val_mae
+    print(f"?? Val Loss: {avg_val_loss:.6f}, MSE: {avg_val_mse:.6f}, MAE: {avg_val_mae:.6f}")
+
+    if combined < best_combined:
+        best_combined = combined
+        autoencoder.save(best_model_path)
+        best_saved = True
+        print(f"? Best model updated at epoch {epoch + 1} with combined: {combined:.6f}")
+
+# === FINAL SAVE === #
+autoencoder.save(final_model_path)
+print(f"\n?? Final model saved to: {final_model_path}") after this i tested a model and i trained multilabel classifier in phase 1  import numpy as np
+import pandas as pd
+import cv2
+import os
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Flatten, Dropout
+from tensorflow.keras.optimizers import Adam
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.model_selection import train_test_split
+import difflib
+from sklearn.metrics import classification_report
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, Callback
+
+# === CONFIG ===
+data_dir = "/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/Dermnet_Images_Preprocessed/"
+label_csv_path = "/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/multi_keywords.csv"
+image_size = (224, 224)  # Resize images to 224x224
+# ------------------
+
+# === Load and clean CSV ===
+df = pd.read_csv(label_csv_path, encoding='latin1')
+df.rename(columns={
+    'Disease Name': 'disease',
+    'File Name': 'filename',
+    'Keywords': 'keywords'
+}, inplace=True)
+
+# Clean keyword spacing
+df['keywords'] = df['keywords'].str.replace(r'\s*,\s*', ',', regex=True)
+
+# === Image Loading with Validation ===
+X_imgs = []
+valid_records = []
+
+# ?? Recursively collect all image files from subdirectories
+all_image_files = []
+for root, _, files in os.walk(data_dir):
+    for file in files:
+        if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+            all_image_files.append(os.path.join(root, file))
+
+# Function to match filenames
+def find_best_match(fname):
+    image_names = [os.path.splitext(os.path.basename(f))[0].lower() for f in all_image_files]
+    matches = difflib.get_close_matches(fname.lower(), image_names, n=1, cutoff=0.8)
+    if matches:
+        matched = matches[0]
+        for f in all_image_files:
+            if os.path.basename(f).lower().startswith(matched):
+                return f
+    return None
+
+# Try matching images
+for _, row in df.iterrows():
+    fname = row['filename']
+    matched_path = find_best_match(fname)
+
+    if matched_path:
+        img = cv2.imread(matched_path)
+        if img is not None:
+            img = cv2.resize(img, image_size) / 255.0
+            X_imgs.append(img)
+            valid_records.append(row)
+        else:
+            print(f"?? Could not read image (corrupted?): {matched_path}")
+    else:
+        print(f"? No match found for: {fname}")
+
+# Filter dataframe to only valid images
+df = pd.DataFrame(valid_records)
+X_imgs = np.array(X_imgs)
+
+# === Print DataFrame as Excel Sheet ===
+print("\n?? Data Preview (Excel sheet):")
+print(df.head())  # Shows the first few rows of the DataFrame
+
+# === Statistics for the First 62 Images ===
+X_imgs_62 = X_imgs[:62]  # Select the first 62 images
+mean = np.mean(X_imgs_62, axis=(0, 1, 2))  # Mean per image
+stddev = np.std(X_imgs_62, axis=(0, 1, 2))  # Standard Deviation per image
+max_value = np.max(X_imgs_62, axis=(0, 1, 2))  # Max value per image
+min_value = np.min(X_imgs_62, axis=(0, 1, 2))  # Min value per image
+
+# Flatten to compute statistics
+flattened_imgs = X_imgs_62.reshape(-1, X_imgs_62.shape[-1])
+q1 = np.percentile(flattened_imgs, 25, axis=0)
+q2 = np.percentile(flattened_imgs, 50, axis=0)  # Median (Q2)
+q3 = np.percentile(flattened_imgs, 75, axis=0)
+
+# Print the statistics for images
+print("\n?? Image Statistics (First 62 Images):")
+print(f"Mean: {mean}")
+print(f"StdDev: {stddev}")
+print(f"Max: {max_value}")
+print(f"Min: {min_value}")
+print(f"Q1 (25th percentile): {q1}")
+print(f"Q2 (50th percentile - Median): {q2}")
+print(f"Q3 (75th percentile): {q3}")
+
+# === Multi-label encoding ===
+all_labels = df['keywords'].str.split(',')
+mlb = MultiLabelBinarizer()
+y_labels = mlb.fit_transform(all_labels)
+np.save("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/mlb_classes.npy", mlb.classes_)
+
+
+# === Load pretrained feature extractors ===
+discriminator = tf.keras.models.load_model("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/unet_FinalDiscriminator.keras", compile=False)
+autoencoder = tf.keras.models.load_model("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/finalmodel1ac.keras", compile=False)
+
+# Extracting feature models
+disc_feat_model = Model(discriminator.input, discriminator.layers[-2].output)
+ae_feat_model = Model(autoencoder.input, autoencoder.layers[-2].output)
+
+# === Extract features ===
+disc_feats = disc_feat_model.predict(X_imgs, batch_size=32)
+ae_feats = ae_feat_model.predict(X_imgs, batch_size=32)
+X_combined = np.concatenate([disc_feats, ae_feats], axis=1)
+
+# === Train classifier ===
+X_train, X_val, y_train, y_val = train_test_split(X_combined, y_labels, test_size=0.2, random_state=42)
+
+# Define model
+inputs = Input(shape=X_train.shape[1:])
+x = Dense(128, activation='relu')(inputs)
+x = Dropout(0.5)(x)  # Dropout to reduce overfitting
+x = Dense(64, activation='relu')(x)
+x = Dropout(0.5)(x)  # Additional Dropout layer
+x = Dense(32, activation='relu')(x)
+x = Dropout(0.5)(x)  # Additional Dropout layer
+x = Dense(16, activation='relu')(x)
+x = Flatten()(x)
+outputs = Dense(len(mlb.classes_), activation='sigmoid')(x)
+
+classifier = Model(inputs, outputs)
+
+# === Print Model Summary ===
+print("\n?? Model Summary:")
+classifier.summary()
+
+# === Compile the model ===
+classifier.compile(optimizer=Adam(1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+
+# === Custom Callback for Accuracy Threshold ===
+class AccuracyThresholdCallback(Callback):
+    def __init__(self, threshold=0.84, patience=3):
+        super(AccuracyThresholdCallback, self).__init__()
+        self.threshold = threshold
+        self.patience = patience
+        self.best_val_accuracy = 0
+        self.epochs_since_threshold = 0
+
+    def on_epoch_end(self, epoch, logs=None):
+        val_accuracy = logs.get('val_accuracy')
+        if epoch > 0 and val_accuracy >= self.threshold:  # Ensure this happens after epoch 1
+            self.model.save("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/multilabel_classifier_84acc.keras")
+            print(f"\n?? Validation accuracy reached {self.threshold * 100}%. Model saved!")
+            self.model.stop_training = True
+
+# === Callbacks ===
+early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6)
+accuracy_threshold_callback = AccuracyThresholdCallback(threshold=0.84, patience=3)
+
+# === Train the model ===
+history = classifier.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=30, batch_size=16,
+                        callbacks=[early_stopping, reduce_lr, accuracy_threshold_callback])
+
+# === Validation Accuracy Statistics ===
+val_accuracy = history.history['val_accuracy']
+
+mean_val_accuracy = np.mean(val_accuracy)
+stddev_val_accuracy = np.std(val_accuracy)
+max_val_accuracy = np.max(val_accuracy)
+min_val_accuracy = np.min(val_accuracy)
+q1_val_accuracy = np.percentile(val_accuracy, 25)
+q2_val_accuracy = np.percentile(val_accuracy, 50)  # Median
+q3_val_accuracy = np.percentile(val_accuracy, 75)
+
+# Print the validation accuracy statistics **after training**
+print("\n?? Validation Accuracy Statistics (over epochs):")
+print(f"Mean: {mean_val_accuracy}")
+print(f"StdDev: {stddev_val_accuracy}")
+print(f"Max: {max_val_accuracy}")
+print(f"Min: {min_val_accuracy}")
+print(f"Q1 (25th percentile): {q1_val_accuracy}")
+print(f"Q2 (50th percentile - Median): {q2_val_accuracy}")
+print(f"Q3 (75th percentile): {q3_val_accuracy}")
+
+# === Load the saved model ===
+saved_model = tf.keras.models.load_model("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/multilabel_classifier_84acc.keras")
+
+# Make predictions on the validation set
+y_pred = saved_model.predict(X_val)
+y_pred = (y_pred > 0.5).astype(int)  # Convert probabilities to binary predictions
+
+# Classification report (Precision, Recall, F1-score)
+print("\n?? Classification Report:")
+print(classification_report(y_val, y_pred, target_names=mlb.classes_))
+
+# === Save feature extraction data for Phase 2 ===
+np.save("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/X_train_feats.npy", X_combined)
+np.save("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/y_train_labels.npy", y_labels)
+
+print("\n? Training Complete! Model saved.") after i trained in phase 2 # === PHASE 2: Train classifier on 7136 unlabeled images using pseudo-labels ===
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import load_model, Model
+from tensorflow.keras.callbacks import Callback
+from tqdm import tqdm
+
+# === Load feature extractors (same as Phase 1) ===
+discriminator = tf.keras.models.load_model("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/unet_FinalDiscriminator.keras", compile=False)
+autoencoder = tf.keras.models.load_model("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/finalmodel1ac.keras", compile=False)
+disc_feat_model = Model(discriminator.input, discriminator.layers[-2].output)
+ae_feat_model = Model(autoencoder.input, autoencoder.layers[-2].output)
+
+# === Load and preprocess 7136 unlabeled images ===
+X_pseudo = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/Dermnet_TrainTestSplit/PreprocessedImages/X_train.npy").astype(np.float32) / 255.0
+
+# === Extract features ===
+features_disc = disc_feat_model.predict(X_pseudo, batch_size=32)
+features_auto = ae_feat_model.predict(X_pseudo, batch_size=32)
+features_combined = np.concatenate([features_disc, features_auto], axis=1)
+
+# === Load Phase 1 trained classifier ===
+classifier = load_model("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/multilabel_classifier_84acc.keras")
+
+# === Load Phase 1 features and labels ===
+X_phase1 = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/X_train_feats.npy")
+y_phase1 = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/y_train_labels.npy")
+
+# === Generate pseudo-labels using Phase 1 classifier ===
+pred_probs = classifier.predict(features_combined, batch_size=32)
+pseudo_labels = (pred_probs > 0.5).astype(int)
+
+# === Save pseudo-labels for future use ===
+pseudo_path = "/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/pseudo_labels_7136.npy"
+np.save(pseudo_path, pseudo_labels)
+print(f"\n?? Pseudo-labels saved to: {pseudo_path}")
+
+# === Combine Phase 1 and Phase 2 data ===
+X_combined_all = np.concatenate([X_phase1, features_combined], axis=0)
+y_combined_all = np.concatenate([y_phase1, pseudo_labels], axis=0)
+
+# === Callback to show proper epoch numbers ===
+class EpochProgressBar(Callback):
+    def on_epoch_begin(self, epoch, logs=None):
+        print(f"\n?? Starting Epoch {epoch + 1}")
+
+    def on_epoch_end(self, epoch, logs=None):
+        print(f"? Completed Epoch {epoch + 1}: val_loss={logs.get('val_loss'):.4f}, val_accuracy={logs.get('val_accuracy'):.4f}")
+
+# === Continue training ===
+classifier.fit(
+    X_combined_all, y_combined_all,
+    batch_size=32,
+    epochs=10,
+    validation_split=0.1,
+    callbacks=[EpochProgressBar()]
+)
+
+# === Save updated model ===
+classifier.save("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/final_multilabel_classifier.keras")
+print("\n?? Phase 2 Complete: Final classifier saved.")
+after this i got images along with actual omage with ground truth label along with model generated label and tested it after this i trained siamese import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Lambda, Dropout
+from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from tensorflow.keras.optimizers import Adam
+import os
+
+# === Load Descriptions CSV ===
+desc_csv_path = "/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/colloquial_descriptions.csv"
+df_desc = pd.read_csv(desc_csv_path, encoding='latin1')
+df_desc.columns = df_desc.columns.str.lower()
+
+required_cols = {'disease', 'file_name', 'keywords', 'description', 'label'}
+if not required_cols.issubset(df_desc.columns):
+    raise ValueError("Missing required columns!")
+
+# === Load data ===
+descriptions_62 = df_desc['description'].fillna('').tolist()
+pred_keywords = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/pseudo_labels_7136.npy")
+class_names = sorted(list(set([kw.strip() for k in df_desc['keywords'] for kw in str(k).split(",")])))
+
+keyword_texts = [
+    " ".join([class_names[i] for i in range(len(row)) if row[i] == 1])
+    for row in pred_keywords
+]
+
+description_texts = descriptions_62[:21] if len(descriptions_62) >= 21 else descriptions_62 * (21 // len(descriptions_62))
+
+# === TF-IDF Vectorization ===
+combined_texts = keyword_texts + description_texts
+vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_features=3000)
+vectorizer.fit(combined_texts)
+
+X_keyword = vectorizer.transform(keyword_texts).toarray()
+X_description = vectorizer.transform(description_texts * (len(X_keyword) // len(description_texts))).toarray()
+
+# === Generate Pairs ===
+pairs_keyword, pairs_description, labels = [], [], []
+num_pairs = 5000
+
+for _ in range(num_pairs):
+    idx = np.random.randint(0, len(keyword_texts))
+    desc_idx = idx % len(description_texts)
+
+    pairs_keyword.append(keyword_texts[idx])
+    pairs_description.append(description_texts[desc_idx])
+    labels.append(1)
+
+    wrong_idx = (desc_idx + np.random.randint(1, len(description_texts))) % len(description_texts)
+    pairs_keyword.append(keyword_texts[idx])
+    pairs_description.append(description_texts[wrong_idx])
+    labels.append(0)
+
+X1 = vectorizer.transform(pairs_keyword).toarray()
+X2 = vectorizer.transform(pairs_description).toarray()
+labels = np.array(labels).reshape(-1, 1)
+
+# === Base Network ===
+def create_base_network(input_dim):
+    inp = Input(shape=(input_dim,))
+    x = Dense(512, activation='relu')(inp)
+    x = Dropout(0.4)(x)
+    x = Dense(256, activation='relu')(x)
+    x = Dropout(0.3)(x)
+    x = Dense(128, activation='relu')(x)
+    return Model(inp, x)
+
+# === Cosine Similarity ===
+def cosine_distance(vectors):
+    x, y = vectors
+    x = K.l2_normalize(x, axis=1)
+    y = K.l2_normalize(y, axis=1)
+    return 1 - K.sum(x * y, axis=1, keepdims=True)
+
+# === Siamese Model ===
+def build_siamese(input_dim):
+    base = create_base_network(input_dim)
+    input_a = Input(shape=(input_dim,))
+    input_b = Input(shape=(input_dim,))
+    vec_a = base(input_a)
+    vec_b = base(input_b)
+    dist = Lambda(cosine_distance)([vec_a, vec_b])
+    out = Dense(1, activation='sigmoid')(dist)
+    
+    return Model(inputs=[input_a, input_b], outputs=out)
+
+# === Train/Validation Split ===
+X1_train, X1_val, X2_train, X2_val, y_train, y_val = train_test_split(
+    X1, X2, labels, test_size=0.2, random_state=42
+)
+
+# === Compile & Train ===
+model = build_siamese(X1.shape[1])
+model.compile(loss='binary_crossentropy', optimizer=Adam(1e-4), metrics=['accuracy'])
+
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=3, min_lr=1e-6)
+]
+
+model.fit(
+    [X1_train, X2_train], y_train,
+    validation_data=([X1_val, X2_val], y_val),
+    epochs=50,
+    batch_size=32,
+    callbacks=callbacks,
+    verbose=1
+)
+
+# === Save Model ===
+model.save("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/siamese_model.keras")
+print("? Siamese model saved successfully!")
+and i tested it after i used lime in it import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Lambda, Dropout
+from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from tensorflow.keras.optimizers import Adam
+import matplotlib.pyplot as plt
+from lime.lime_text import LimeTextExplainer
+
+# === Load Descriptions CSV ===
+desc_csv_path = "/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/colloquial_descriptions.csv"
+df_desc = pd.read_csv(desc_csv_path, encoding='latin1')
+df_desc.columns = df_desc.columns.str.lower()
+
+required_cols = {'disease', 'file_name', 'keywords', 'description', 'label'}
+if not required_cols.issubset(df_desc.columns):
+    raise ValueError("Missing required columns!")
+
+# === Load data ===
+descriptions_62 = df_desc['description'].fillna('').tolist()
+pred_keywords = np.load("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/pseudo_labels_7136.npy")
+class_names = sorted(list(set([kw.strip() for k in df_desc['keywords'] for kw in str(k).split(",")])))
+
+keyword_texts = [
+    " ".join([class_names[i] for i in range(len(row)) if row[i] == 1])
+    for row in pred_keywords
+]
+
+description_texts = descriptions_62[:21] if len(descriptions_62) >= 21 else descriptions_62 * (21 // len(descriptions_62))
+
+# === TF-IDF Vectorization ===
+combined_texts = keyword_texts + description_texts
+vectorizer = TfidfVectorizer(ngram_range=(1, 2), max_features=3000)
+vectorizer.fit(combined_texts)
+
+X_keyword = vectorizer.transform(keyword_texts).toarray()
+X_description = vectorizer.transform(description_texts * (len(X_keyword) // len(description_texts))).toarray()
+
+# === Generate Pairs ===
+pairs_keyword, pairs_description, labels = [], [], []
+num_pairs = 5000
+
+for _ in range(num_pairs):
+    idx = np.random.randint(0, len(keyword_texts))
+    desc_idx = idx % len(description_texts)
+
+    pairs_keyword.append(keyword_texts[idx])
+    pairs_description.append(description_texts[desc_idx])
+    labels.append(1)
+
+    wrong_idx = (desc_idx + np.random.randint(1, len(description_texts))) % len(description_texts)
+    pairs_keyword.append(keyword_texts[idx])
+    pairs_description.append(description_texts[wrong_idx])
+    labels.append(0)
+
+X1 = vectorizer.transform(pairs_keyword).toarray()
+X2 = vectorizer.transform(pairs_description).toarray()
+labels = np.array(labels).reshape(-1, 1)
+
+# === Base Network ===
+def create_base_network(input_dim):
+    inp = Input(shape=(input_dim,))
+    x = Dense(512, activation='relu')(inp)
+    x = Dropout(0.4)(x)
+    x = Dense(256, activation='relu')(x)
+    x = Dropout(0.3)(x)
+    x = Dense(128, activation='relu')(x)
+    return Model(inp, x)
+
+# === Cosine Similarity ===
+def cosine_distance(vectors):
+    x, y = vectors
+    x = K.l2_normalize(x, axis=1)
+    y = K.l2_normalize(y, axis=1)
+    return 1 - K.sum(x * y, axis=1, keepdims=True)
+
+# === Siamese Model ===
+def build_siamese(input_dim):
+    base = create_base_network(input_dim)
+    input_a = Input(shape=(input_dim,))
+    input_b = Input(shape=(input_dim,))
+    vec_a = base(input_a)
+    vec_b = base(input_b)
+    dist = Lambda(cosine_distance)([vec_a, vec_b])
+    out = Dense(1, activation='sigmoid')(dist)
+    return Model(inputs=[input_a, input_b], outputs=out)
+
+# === Train/Validation Split ===
+X1_train, X1_val, X2_train, X2_val, y_train, y_val = train_test_split(
+    X1, X2, labels, test_size=0.2, random_state=42
+)
+
+# === Compile & Train ===
+model = build_siamese(X1.shape[1])
+model.compile(loss='binary_crossentropy', optimizer=Adam(1e-4), metrics=['accuracy'])
+
+callbacks = [
+    EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.3, patience=3, min_lr=1e-6)
+]
+model.fit(
+    [X1_train, X2_train], y_train,
+    validation_data=([X1_val, X2_val], y_val),
+    epochs=50,
+    batch_size=32,
+    callbacks=callbacks,
+    verbose=1
+)
+# === Save Model ===
+model.save("/SASTRA-NEW-CLUSTER/users/bhuvana/skin_dataset/siamese_model1.keras")
+print("? Siamese model saved successfully!")
+# === LIME Explanations ===
+explainer = LimeTextExplainer(class_names=['Not Match', 'Match'])
+# Modify siamese_predict to output a probability for both classes (Match and Not Match)
+def siamese_predict(texts):
+    # Ensure texts are split into correct pairs
+    keyword_texts = texts[:len(texts)//2]
+    description_texts = texts[len(texts)//2:]
+    keyword_features = vectorizer.transform(keyword_texts).toarray()
+    description_features = vectorizer.transform(description_texts).toarray()
+    preds = model.predict([keyword_features, description_features])
+    # Return the full probability distribution for both classes (Not Match, Match)
+    return np.hstack([1 - preds, preds])  # Probability for 'Not Match' (1 - preds) and 'Match' (preds)
+# Example of LIME explanation
+test_keywords = keyword_texts[:10]  # Take first 10 keyword texts
+test_descriptions = description_texts[:10]  # Take first 10 description texts
+
+# Combine the keyword and description pairs as separate instances (make it a flat list)
+test_texts = []
+for keyword, description in zip(test_keywords, test_descriptions):
+    test_texts.append(keyword)
+    test_texts.append(description)
+
+# Ensure test_texts have the same number of elements for LIME
+assert len(test_texts) == len(test_keywords) + len(test_descriptions)
+
+# Get explanation for the first keyword-description pair
+explanation = explainer.explain_instance(test_texts[0], siamese_predict, num_features=5)
+
+# Visualize the explanation for the first pair
+explanation.show_in_notebook(text=True)
+
+# Optional: If you want to plot it with matplotlib
+temp, mask = explanation.get_image_and_mask(label=1, positive_only=True, num_features=5, min_weight=0.0)
+plt.imshow(mask, cmap='Blues', interpolation='none')
+plt.title('Keyword-Description Match Explanation')
+plt.axis('off')
+plt.show()
+ 
+

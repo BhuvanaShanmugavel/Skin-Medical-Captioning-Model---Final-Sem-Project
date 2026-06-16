@@ -1,0 +1,63 @@
+Image Name,Disease,Body Part,Severity,Color,Source
+acne_legs_mild_white,acne,legs,mild,white,dermnet
+acne_torso_severe_red,acne,torso,severe,red,dermnet
+acne_torso_severe_brown,acne,torso,severe,brown,dermnet
+acne_face_moderate_red,acne,face,moderate,red,dermnet
+acne_hand_moderate_red,acne,hand,moderate,red,dermnet
+acne_face_extreme_brown,acne,face,extreme,brown,dermnet
+ak_face_moderate_brown,actinic keratosis,face,moderate,brown,dermnet
+ak_face_severe_red,actinic keratosis,face,severe,red,dermnet
+ak_hand_mild_white,actinic keratosis,hand,mild,white,dermnet
+ak_hand_moderate_white,actinic keratosis,hand,moderate,white,dermnet
+ak_legs_moderate_brown,actinic keratosis,legs,moderate,brown,dermnet
+eczema_torso_severe_red,eczema,torso,severe,red,dermnet
+eczema_hand_severe_brown,eczema,hand,severe,brown,dermnet
+eczema_torso_moderate_red,eczema,torso,moderate,red,dermnet
+eczema_face_moderate_white,eczema,face,moderate,white,dermnet
+eczema_face_extreme_brown,eczema,face,extreme,brown,dermnet
+eczema_hand_moderate_red,eczema,hand,moderate,red,dermnet
+eczema_legs_severe_red,eczema,legs,severe,red,dermnet
+herpes_zoster_hand_mild_white,herpes zoster,hand,mild,white,dermnet
+herpes_zoster_hand_moderate_red,herpes zoster,hand,moderate,red,dermnet
+herpes_zoster_legs_extreme_red,herpes zoster,legs,extreme,red,dermnet
+herpes_zoster_legs_severe_red,herpes zoster,legs,severe,red,dermnet
+herpes_zoster_torso_mild_red,herpes zoster,torso,mild,red,dermnet
+herpes_zoster_torso_moderate_brown,herpes zoster,torso,moderate,brown,dermnet
+herpes_zoster_face_mild_white,herpes zoster,face,mild,white,dermnet
+herpes_zoster_face_extreme_brown,herpes zoster,face,extreme,brown,dermnet
+melanoma_torso_severe_brown,melanoma,torso,severe,brown,dermnet
+melanoma_face_severe_red,melanoma,face,severe,red,dermnet
+melanoma_hand_extreme-brown,melanoma,hand,extreme,brown,dermnet
+melanoma_legs_mild_brown,melanoma,legs,mild,brown,dermnet
+melanoma_legs_moderate_brown,melanoma,legs,moderate,brown,dermnet
+melanoma_torso_moderate_brown,melanoma,torso,moderate,brown,dermnet
+paronychia_hand_moderate_brown,paronychia,hand,moderate,brown,dermnet
+paronychia_hand_mild_brown,paronychia,hand,mild,brown,dermnet
+paronychia_hand_extreme_red,paronychia,hand,extreme,red,dermnet
+paronychia_hand_moderate_red,paronychia,hand,moderate,red,dermnet
+paronychia_hand_severe_brown,paronychia,hand,severe,brown,dermnet
+psoriasis_torso_severe_red,psoriasis,torso,severe,red,dermnet
+psoriasis_face_severe_red,psoriasis,face,severe,red,dermnet
+psoriasis_face_moderate_red,psoriasis,face,moderate,red,dermnet
+psoraisis_hand_moderate_brown,psoriasis,hand,moderate,brown,dermnet
+psoriasis_legs_severe_red,psoriasis,legs,severe,red,dermnet
+psoriasis_torso_extreme_brown,psoriasis,torso,extreme,brown,dermnet
+psoriasis_hand_severe_red,psoriasis,hand,severe,red,dermnet
+psoriasis_legs_moderate_white,psoriasis,legs,moderate,white,dermnet
+sd_face_extreme_brown,seborrheic dermtitis,face,extreme,brown,dermnet
+sd_face_moderate_red,seborrheic dermtitis,face,moderate,red,dermnet
+sd_hand_severe_red,seborrheic dermtitis,hand,severe,red,dermnet
+sd_legs_moderate_brown,seborrheic dermtitis,legs,moderate,brown,dermnet
+sd_torso_severe_red,seborrheic dermtitis,torso,severe,red,dermnet
+tinea_face_moderate_red,tinea,face,moderate,red,dermnet
+tinea_hand_extreme_red,tinea,hand,extreme,red,dermnet
+tinea_hand_moderate_white,tinea,hand,moderate,white,dermnet
+tinea_legs_moderate_white,tinea,legs,moderate,white,dermnet
+tinea_legs_severe_red,tinea,legs,severe,red,dermnet
+tinea_torso_moderate_brown,tinea,torso,moderate,brown,dermnet
+vitiligo_torso_moderate_white,vitiligo,torso,moderate,white,dermnet
+vitiligo_legs_mild_white,vitiligo,legs,mild,white,dermnet
+vitiligo_hand_severe_white,vitiligo,hand,severe,white,dermnet
+vitiligo_legs_extreme_white,vitiligo,legs,extreme,white,dermnet
+vitiligo_face_moderate_white,vitiligo,face,moderate,white,dermnet
+vitiligo_hand_extreme_white,vitiligo,hand,extreme,white,dermnet
